@@ -1,5 +1,5 @@
 from flask import Blueprint, request
-from ..services.youtube_service import YouTubeService
+from ..services.youtube_service import YouTubeService, YouTubeError
 from ..utils.cache_manager import CacheManager
 from ..utils.response_formatter import api_response, error_response
 from ..utils.rate_limiter import limiter
@@ -59,6 +59,8 @@ def video_metadata(video_id):
     try:
         result = youtube_service.video_metadata(video_id)
         return api_response(result)
+    except YouTubeError as e:
+        return error_response(e.reason or str(e), 502)
     except Exception as e:
         return error_response(str(e), 500)
 
@@ -69,6 +71,9 @@ def player_streams(video_id):
     try:
         result = youtube_service.player(video_id)
         return api_response(result)
+    except YouTubeError as e:
+        # Antes devolvia 200 com arrays vazios; agora o motivo real volta ao cliente.
+        return error_response(e.reason or str(e), 502)
     except Exception as e:
         return error_response(str(e), 500)
 
@@ -89,6 +94,8 @@ def video_captions(video_id):
     try:
         result = youtube_service.captions(video_id)
         return api_response(result)
+    except YouTubeError as e:
+        return error_response(e.reason or str(e), 502)
     except Exception as e:
         return error_response(str(e), 500)
 

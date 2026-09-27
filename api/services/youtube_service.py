@@ -1,38 +1,170 @@
+import re
+import time
+
 import httpx
 import cachetools
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from cachetools import TTLCache
+
+class InnertubeClient:
+    """Um client do Innertube (nome interno, id numerico, versao, extras)."""
+
+    def __init__(self, name: str, client_id: str, version: str, user_agent: str, **extra: Any):
+        self.name = name
+        self.client_id = client_id
+        self.version = version
+        self.user_agent = user_agent
+        self.extra = extra
+
+
+# YouTube recusa clients desatualizados com UNPLAYABLE / "page needs to be reloaded".
+# A versao do WEB precisa ser a atual (extraida da pagina a cada inicializacao).
+DEFAULT_WEB_VERSION = "2.20260925.01.00"
+
+CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
+
+# Ordem importa: WEB primeiro (melhor metadado), depois os clients moveis
+# que costumam devolver streamingData sem PO token.
+PLAYER_CLIENTS = [
+    InnertubeClient("ANDROID", "3", "20.10.38",
+                    "com.google.android.youtube/20.10.38 (Linux; U; Android 14)"),
+    InnertubeClient("ANDROID", "3", "21.05.34",
+                    "com.google.android.youtube/21.05.34 (Linux; U; Android 14)"),
+    InnertubeClient("ANDROID_VR", "28", "1.65.10",
+                    "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12)"),
+    InnertubeClient("IOS", "5", "20.10.4",
+                    "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3 like Mac OS X)"),
+    InnertubeClient("TVHTML5", "7", "7.20250316.18.00",
+                    "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15"),
+    InnertubeClient("WEB", "1", DEFAULT_WEB_VERSION, CHROME_UA),
+    InnertubeClient("MWEB", "2", DEFAULT_WEB_VERSION, CHROME_UA),
+]
+
+
+class YouTubeError(Exception):
+    def __init__(self, message: str, status: Optional[str] = None, reason: Optional[str] = None):
+        super().__init__(message)
+        self.status = status
+        self.reason = reason
+
 
 class YouTubeService:
     def __init__(self):
         self.base_url = "https://www.youtube.com/youtubei/v1"
         self.api_key = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
-        self.client_version = "2.20241118.01.00"
+        self.client_version = DEFAULT_WEB_VERSION
         self.cache = TTLCache(maxsize=100, ttl=300)
-        self.session = httpx.Client(timeout=30.0)
+        self.session = httpx.Client(timeout=30.0, follow_redirects=True)
+        self.visitor_data: Optional[str] = None
+        self._visitor_ts = 0.0
+        self._fetch_visitor_data()
 
-    def _make_request(self, endpoint: str, data: Dict) -> Dict:
+    def _fetch_visitor_data(self) -> None:
+        """visitorData + clientVersion atuais, lidos da pagina /embed.
+
+        Sem isso o WEB responde UNPLAYABLE ('Video unavailable').
+        """
+        try:
+            r = self.session.get(
+                "https://www.youtube.com/embed/dQw4w9WgXcQ",
+                headers={"User-Agent": CHROME_UA, "Accept-Language": "en-US,en;q=0.9"},
+            )
+            vm = re.search(r'"visitorData":"([^"]+)"', r.text)
+            if vm:
+                self.visitor_data = vm.group(1)
+            ver = re.search(r'"INNERTUBE_CLIENT_VERSION":"([^"]+)"', r.text)
+            if ver:
+                self.client_version = ver.group(1)
+            key = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', r.text)
+            if key:
+                self.api_key = key.group(1)
+            self._visitor_ts = time.time()
+        except Exception:
+            pass
+
+    def _maybe_refresh_visitor(self) -> None:
+        if not self.visitor_data or time.time() - self._visitor_ts > 1800:
+            self._fetch_visitor_data()
+
+    def _make_request(self, endpoint: str, data: Dict, client: Optional[InnertubeClient] = None) -> Dict:
+        client = client or PLAYER_CLIENTS[0]
+        version = client.version
+        if client.name in ("WEB", "MWEB"):
+            self._maybe_refresh_visitor()
+            version = self.client_version
+
+        context_client: Dict[str, Any] = {
+            "hl": "en",
+            "gl": "US",
+            "clientName": client.name,
+            "clientVersion": version,
+        }
+        context_client.update(client.extra)
+        # visitorData pertence ao client WEB. Reutilizar esse token em clients
+        # mobile/TV faz o YouTube responder 400 (Precondition check failed).
+        uses_visitor = client.name in ("WEB", "MWEB")
+        if self.visitor_data and uses_visitor:
+            context_client["visitorData"] = self.visitor_data
+
+        context: Dict[str, Any] = {"client": context_client}
+        if client.extra.get("clientScreen") == "EMBED":
+            context["thirdParty"] = {"embedUrl": "https://www.youtube.com/"}
+        elif client.name.startswith("TVHTML5"):
+            context["thirdParty"] = {"embedUrl": "https://www.youtube.com/"}
+
+        payload: Dict[str, Any] = {"context": context, **data}
+        if endpoint == "player":
+            payload.setdefault("contentCheckOk", True)
+            payload.setdefault("racyCheckOk", True)
+
         headers = {
             "Content-Type": "application/json",
-            "X-YouTube-Client-Name": "1",
-            "X-YouTube-Client-Version": self.client_version,
+            "X-YouTube-Client-Name": client.client_id,
+            "X-YouTube-Client-Version": version,
             "Origin": "https://www.youtube.com",
-            "User-Agent": "Mozilla/5.0 (compatible; HAPI2/1.0)"
+            "Referer": "https://www.youtube.com/",
+            "User-Agent": client.user_agent,
+            "Accept-Language": "en-US,en;q=0.9",
         }
-        payload = {
-            "context": {
-                "client": {
-                    "hl": "en",
-                    "gl": "US",
-                    "clientName": "WEB",
-                    "clientVersion": self.client_version
-                }
-            },
-            **data
-        }
-        response = self.session.post(f"{self.base_url}/{endpoint}", json=payload, headers=headers)
+        if self.visitor_data and uses_visitor:
+            headers["X-Goog-Visitor-Id"] = self.visitor_data
+
+        url = f"{self.base_url}/{endpoint}"
+        # Android/iOS exigem a API key na query string.
+        if client.name in ("ANDROID", "IOS"):
+            url = f"{url}?key={self.api_key}"
+        response = self.session.post(url, json=payload, headers=headers)
         response.raise_for_status()
         return response.json()
+
+    @staticmethod
+    def _playability(result: Dict) -> tuple:
+        ps = result.get("playabilityStatus", {}) or {}
+        return ps.get("status"), ps.get("reason"), ps.get("errorScreen", {})
+
+    def _player_request(self, video_id: str, clients: Optional[List[InnertubeClient]] = None) -> Dict:
+        """Chama /player; se um client falhar, tenta o proximo. Erro final elanca YouTubeError."""
+        clients = clients or PLAYER_CLIENTS
+        last_status = None
+        last_reason = None
+        for client in clients:
+            try:
+                result = self._make_request("player", {"videoId": video_id}, client)
+            except Exception as e:
+                last_status, last_reason = "REQUEST_FAILED", str(e)
+                continue
+            status, reason, _ = self._playability(result)
+            if status == "OK" and result.get("streamingData"):
+                result["_client_used"] = client.name
+                return result
+            if status == "OK":
+                result["_client_used"] = client.name
+                return result
+            last_status, last_reason = status, reason
+        raise YouTubeError(last_reason or "no formats returned by YouTube", last_status, last_reason)
 
     def search(self, query: str, max_results: int = 20) -> Dict[str, Any]:
         cache_key = f"search_{query}_{max_results}"
@@ -75,42 +207,47 @@ class YouTubeService:
         cache_key = f"video_{video_id}"
         if cache_key in self.cache:
             return self.cache[cache_key]
-        data = {"videoId": video_id}
-        result = self._make_request("player", data)
+        result = self._player_request(video_id)
         self.cache[cache_key] = result
         return result
+
+    @staticmethod
+    def _format_entry(fmt: Dict) -> Dict[str, Any]:
+        return {
+            "itag": fmt.get("itag"),
+            "mime_type": fmt.get("mimeType"),
+            "quality": fmt.get("qualityLabel") or fmt.get("quality"),
+            "url": fmt.get("url"),
+            "cipher": fmt.get("signatureCipher"),
+            "bitrate": fmt.get("bitrate"),
+            "fps": fmt.get("fps"),
+            "width": fmt.get("width"),
+            "height": fmt.get("height"),
+            "audio_quality": fmt.get("audioQuality"),
+            "content_length": fmt.get("contentLength"),
+            "approx_duration_ms": fmt.get("approxDurationMs"),
+        }
 
     def player(self, video_id: str) -> Dict[str, Any]:
         cache_key = f"player_{video_id}"
         if cache_key in self.cache:
             return self.cache[cache_key]
-        data = {"videoId": video_id}
-        result = self._make_request("player", data)
+        result = self._player_request(video_id)
         formats = []
-        streaming_data = result.get("streamingData", {})
+        streaming_data = result.get("streamingData", {}) or {}
         for fmt in streaming_data.get("formats", []):
-            formats.append({
-                "itag": fmt.get("itag"),
-                "mime_type": fmt.get("mimeType"),
-                "quality": fmt.get("quality"),
-                "url": fmt.get("url"),
-                "bitrate": fmt.get("bitrate"),
-                "width": fmt.get("width"),
-                "height": fmt.get("height")
-            })
+            formats.append(self._format_entry(fmt))
         adaptive_formats = []
         for fmt in streaming_data.get("adaptiveFormats", []):
-            adaptive_formats.append({
-                "itag": fmt.get("itag"),
-                "mime_type": fmt.get("mimeType"),
-                "quality": fmt.get("quality"),
-                "url": fmt.get("url"),
-                "bitrate": fmt.get("bitrate"),
-                "width": fmt.get("width"),
-                "height": fmt.get("height")
-            })
+            adaptive_formats.append(self._format_entry(fmt))
+        video_details = result.get("videoDetails", {}) or {}
         self.cache[cache_key] = {
             "video_id": video_id,
+            "title": video_details.get("title"),
+            "length_seconds": video_details.get("lengthSeconds"),
+            "is_live": (result.get("playabilityStatus", {}) or {}).get("liveStreamability") is not None
+                        or video_details.get("isLive", False),
+            "client_used": result.get("_client_used"),
             "formats": formats,
             "adaptive_formats": adaptive_formats,
             "expires_in": streaming_data.get("expiresInSeconds")
@@ -122,7 +259,7 @@ class YouTubeService:
         if cache_key in self.cache:
             return self.cache[cache_key]
         data = {"videoId": video_id}
-        result = self._make_request("next", data)
+        result = self._make_request("next", data, PLAYER_CLIENTS[0])
         self.cache[cache_key] = result
         return result
 
@@ -130,8 +267,7 @@ class YouTubeService:
         cache_key = f"captions_{video_id}"
         if cache_key in self.cache:
             return self.cache[cache_key]
-        data = {"videoId": video_id}
-        result = self._make_request("player", data)
+        result = self._player_request(video_id)
         caption_tracks = []
         captions_data = result.get("captions", {}).get("playerCaptionsTracklistRenderer", {})
         for track in captions_data.get("captionTracks", []):

@@ -6,7 +6,7 @@ Comprehensive Python/Flask data aggregation API serving YouTube, SoundCloud, and
 
 | Environment | URL |
 |-------------|-----|
-| Production | `https://HAPI2.vercel.app` |
+| Production | `https://xryapi.vercel.app` |
 | Local | `http://localhost:5000` |
 
 ## Response Format
